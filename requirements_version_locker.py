@@ -4,8 +4,9 @@ Doug Barry @ UoG 20221213
 Idea from: https://gitlab.com/pdebelak/dotfiles/-/blob/83082cd567f5edd4da90d2297246af9c42b98397/scripts/pip-hash-freeze
 and blog post: https://www.peterdebelak.com/blog/generating-a-fully-qualified-and-hashed-requirements-file/
 """
-
+import errno
 import pathlib
+from typing import Any
 from urllib.request import urlopen
 import pkg_resources
 import json
@@ -30,11 +31,14 @@ class Package:
         self.version = version
         self.hashes = hashes
 
-    def __str__(self) -> str:
+    def get_file_lines(self) -> str:
         package_text = f'{self.name}=={self.version}'
         for phash in self.hashes:
             package_text += f'{self.__newline}--hash=sha256:{phash}'
         return package_text
+
+    def __str__(self) -> str:
+        return f'{self.name}=={self.version}'
 
 
 class RequirementsVersionLocker:
@@ -42,21 +46,34 @@ class RequirementsVersionLocker:
     A class module which 'freezes' requirements.txt files with a specified version, adding package hash information.
     """
 
-    _logger: logging.Logger
-
-    def __init__(self, verbose_mode=False):
-        self._logger = logging.getLogger(__class__.__name__)
-        self._logger.setLevel(logging.INFO)
-        if verbose_mode:
-            self._logger.setLevel(logging.DEBUG)
-
-    def _log_get(self) -> logging.Logger:
+    @property
+    def log(self) -> logging.Logger:
         return self._logger
 
-    log = property(
-        fget=_log_get,
-        doc="Instance logger"
-    )
+    def __init__(self, app_config: dict):
+        self._logger: logging.Logger = None
+        self.__config: dict = {}
+        self.ignore_errors: bool
+        self.overwrite_mode: bool
+        self.verbose_mode: bool
+
+        self._logger = logging.getLogger(__class__.__name__)
+        self._logger.setLevel(logging.INFO)
+
+        if not app_config:
+            raise ValueError('Configuration values not supplied')
+
+        self.__config = app_config
+
+    def config(self, key: Any, default: Any = None) -> Any:
+        if not self.__config:
+            raise ValueError("Configuration not defined")
+        return self.__config.get(key, default)
+
+    def config_require(self, key: Any) -> Any:
+        if key not in self.__config.keys():
+            raise KeyError(f'Configuration did not contain key: {key}')
+        return self.__config.get(key)
 
     def get_required_packages(self, requirements_file: str) -> list:
         """
@@ -93,8 +110,7 @@ class RequirementsVersionLocker:
                 data = json.load(f)
                 self.log.debug(f"JSON data returned: '{data}'")
         except Exception as ex:
-            self.log.error(f"Unable to connect to PyPi AP endpoint: {json_api_url}'")
-            self.log.debug(ex)
+            self.log.warning(f"Unable to connect to PyPi AP endpoint: {json_api_url}'. Exception: '{ex}'")
             raise ex
 
         data_dict = {}
@@ -118,67 +134,86 @@ class RequirementsVersionLocker:
 
         return Package(package_name, package_version, hashes)
 
-    def write_requirements_file(self, output_file: str, output_packages: str, overwrite: bool = True) -> bool:
+    def write_requirements_file(self, output_file: str, output_packages: str) -> bool:
         """
-        Write a new requirements file with package hash information in correct format for pip
+        Write a new requirements file with package hash information in correct format for pip. This will overwrite
+        any existing file
         """
 
-        if pathlib.Path(output_file).exists():
-            if not overwrite:
-                raise FileExistsError(f"'{output_file}' exists and overwrite option not specified")
-
-        self.log.info(f"Writing new requirements file to '{output_file}'")
         with pathlib.Path(output_file).open('w') as requirements_new_txt:
             for package in output_packages:
-                requirements_new_txt.write(f'{str(package)}\n')
+                if package:
+                    requirements_new_txt.write(f'{package.get_file_lines()}\n')
 
-    def run(self, input_file: str, output_file: str, overwrite_mode: bool = False) -> int:
+        return True
+
+    def run(self) -> int:
         """
         Run this module
         """
 
+        if self.config('verbose_mode'):
+            self.log.setLevel(logging.DEBUG)
+
+        self.verbose_mode = self.config('verbose_mode', False)
+        self.overwrite_mode = self.config('overwrite_mode', False)
+        self.ignore_errors = self.config('ignore_errors', False)
+
+        input_file = self.config_require('input_file')
+        output_file = self.config_require('output_file')
+
         if not pathlib.Path(input_file).exists():
-            self.log.error(f"File '{input_file}' does not exist")
-            return 1
+            self.log.fatal(f"File '{input_file}' does not exist")
+            return errno.ENOENT
+
+        if pathlib.Path(output_file).exists():
+            if not self.overwrite_mode:
+                self.log.fatal(f"'{output_file}' exists and overwrite option not specified")
+                return errno.EEXIST
 
         self.log.info('Assessing packages')
         try:
             input_packages = self.get_required_packages(input_file)
-        except Exception as ex:
+        except Exception as ex1:
             self.log.error(f"Error assessing packages from '{input_file}'")
-            self.log.debug(ex)
-            return 1
+            self.log.debug(ex1)
+            return errno.EIO
 
         if not input_packages:
             self.log.error("Unable to load input file")
-            return 1
+            return errno.EIO
 
         output_packages = []
 
         self.log.info('Gathering hash information')
         for package in input_packages:
             try:
-                output_packages.append(self.get_package_details_from_api(str(package.name),str(package.specs[0][1])))
-            except Exception as ex:
-                self.log.debug(ex)
-                return 1
+                details = self.get_package_details_from_api(str(package.name), str(package.specs[0][1]))
+                output_packages.append(details)
+            except Exception as ex1:
+                if not self.ignore_errors:
+                    self.log.fatal(ex1)
+                    return 1
+                self.log.debug(ex1)
 
-        self.log.info(f'Writing new hash locked requirements to {output_file}')
+        self.log.info(f"Writing new hash locked requirements to '{output_file}'")
 
         try:
-            self.write_requirements_file(output_file, output_packages, overwrite_mode)
+            if not self.write_requirements_file(output_file, output_packages):
+                self.log.error(f"Unable to write requirements file '{output_file}'")
         except FileExistsError as fee:
-            self.log.info(f"Writing failed: {fee.args[0]}")
+            self.log.error(f"Writing failed: {fee.args[0]}")
             return 1
-        except Exception as ex:
-            self.log.exception(ex)
+        except Exception as ex1:
+            self.log.exception(ex1)
             return 1
 
+        self.log.info(f"Successfully wrote file.")
         return 0
 
 
 if __name__ == "__main__":
-    logging.basicConfig(stream=sys.stdout, level=logging.DEBUG)
+    logging.basicConfig(stream=sys.stdout, level=logging.INFO)
 
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -194,18 +229,30 @@ if __name__ == "__main__":
         help="Overwrite output file if it exists", default=False
     )
     parser.add_argument(
+        "-q", "--ignore-errors", action=argparse.BooleanOptionalAction, dest="ignore_errors", required=False,
+        help="Ignore missing packages on PyPi", default=False
+    )
+    parser.add_argument(
         "-v", "--verbose", action=argparse.BooleanOptionalAction, dest="verbose_mode", required=False,
         help="Enable verbose output", default=False
     )
 
     args = parser.parse_args()
 
-    app = RequirementsVersionLocker(verbose_mode=args.verbose_mode)
+    config = dict()
+    config['verbose_mode'] = args.verbose_mode
+    config['input_file'] = args.input_file
+    config['output_file'] = args.output_file
+    config['overwrite_mode'] = args.overwrite_mode
+    config['ignore_errors'] = args.ignore_errors
 
-    exit(
-        app.run(
-            input_file=args.input_file,
-            output_file=args.output_file,
-            overwrite_mode=args.overwrite_mode
-        )
-    )
+    app = RequirementsVersionLocker(config)
+
+    result: int = 1
+    try:
+        result = app.run()
+    except Exception as ex:
+        logging.exception(ex)
+        result = 1
+
+    exit(result)
