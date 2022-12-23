@@ -164,7 +164,7 @@ class RequirementsVersionLocker:
 
         return f'#\n' \
                f'# WARNING: Some packages were not pinned, possible due to version information not being available, or ' \
-               f'installed libraries\n being provided by the host OS are customised.\n' \
+               f'installed libraries\n# being provided by the host OS are customised.\n' \
                f'#\n' \
                f'{pkgs}'
 
